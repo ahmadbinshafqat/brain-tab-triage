@@ -1,121 +1,393 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Archive, ClipboardPaste, RotateCcw, Trash2 } from 'lucide-react';
-import { parseInput } from './parser';
-import { loadItems, saveItems } from './storage';
-import { seedItems } from './seed';
-import type { Bucket, Item } from './types';
+import { BUCKET_LABELS, BUCKETS, type Bucket, type TriagedItem } from './types';
+import { buildExportPayload, clearItems, countByBucket, loadItems, saveItems } from './storage';
 
-const buckets: Array<{ id: Bucket; label: string; hint: string }> = [
-  { id: 'keep', label: 'Keep', hint: 'High relevance, act soon' },
-  { id: 'later', label: 'Later', hint: 'Useful, not urgent' },
-  { id: 'toss', label: 'Toss', hint: 'Low signal or distraction' }
+const SAMPLE_INPUT = `https://react.dev/learn React documentation
+SQLite tips - https://sqlite.org/docs.html
+A title without URL
+https://example.com/article`;
+
+const SCORE_TERMS = [
+  'docs',
+  'documentation',
+  'guide',
+  'learn',
+  'tutorial',
+  'reference',
+  'engineering',
+  'productivity',
+  'sqlite',
+  'react',
+  'typescript',
+  'api',
+  'design',
+  'architecture',
 ];
 
-export function App() {
-  const [items, setItems] = useState<Item[]>(() => loadItems());
-  const [input, setInput] = useState('');
-  const [message, setMessage] = useState('');
+const NOISY_TERMS = ['shopping', 'coupon', 'sale', 'shorts', 'viral', 'celebrity'];
 
-  useEffect(() => saveItems(items), [items]);
+function App() {
+  const [items, setItems] = useState<TriagedItem[]>(() => loadItems());
+  const [input, setInput] = useState(SAMPLE_INPUT);
+  const [status, setStatus] = useState('');
 
-  const sortedItems = useMemo(() => [...items].sort((a, b) => b.score - a.score), [items]);
-  const counts = buckets.map((b) => ({ ...b, count: items.filter((i) => i.bucket === b.id).length }));
+  useEffect(() => {
+    saveItems(items);
+  }, [items]);
+
+  const counts = useMemo(() => countByBucket(items), [items]);
 
   function importItems() {
-    const parsed = parseInput(input);
-    if (!parsed.length) {
-      setMessage('Paste at least one title or URL.');
+    const imported = parseInput(input);
+    if (imported.length === 0) {
+      setStatus('Paste at least one non-empty line to import.');
       return;
     }
-    const existingKeys = new Set(items.map((i) => i.url || i.title.toLowerCase()));
-    const fresh = parsed.filter((i) => !existingKeys.has(i.url || i.title.toLowerCase()));
-    setItems((current) => [...fresh, ...current]);
-    setInput('');
-    setMessage(`Imported ${fresh.length} item${fresh.length === 1 ? '' : 's'} and auto-bucketed by score.`);
+
+    setItems((current) => [...imported, ...current]);
+    setStatus(`Imported ${imported.length} item${imported.length === 1 ? '' : 's'}.`);
   }
 
-  function updateItem(id: string, patch: Partial<Item>) {
-    setItems((current) => current.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+  function updateBucket(id: string, bucket: Bucket) {
+    setItems((current) => current.map((item) => (item.id === id ? { ...item, bucket } : item)));
+  }
+
+  function updateNotes(id: string, notes: string) {
+    setItems((current) => current.map((item) => (item.id === id ? { ...item, notes } : item)));
   }
 
   function removeItem(id: string) {
     setItems((current) => current.filter((item) => item.id !== id));
   }
 
-  async function handleDrop(event: React.DragEvent<HTMLTextAreaElement>) {
-    event.preventDefault();
-    const file = event.dataTransfer.files[0];
-    if (file) {
-      setInput(await file.text());
-      setMessage(`Loaded ${file.name}. Click Triage list to import.`);
+  function resetBoard() {
+    setItems([]);
+    clearItems();
+    setStatus('Board cleared.');
+  }
+
+  function exportJson() {
+    if (items.length === 0) {
+      setStatus('Nothing to export yet.');
+      return;
+    }
+
+    const payload = buildExportPayload(items);
+    downloadFile(
+      `tab-triage-${dateStamp()}.json`,
+      JSON.stringify(payload, null, 2),
+      'application/json;charset=utf-8',
+    );
+    setStatus('Downloaded JSON export.');
+  }
+
+  function exportCsv() {
+    if (items.length === 0) {
+      setStatus('Nothing to export yet.');
+      return;
+    }
+
+    downloadFile(`tab-triage-${dateStamp()}.csv`, toCsv(items), 'text/csv;charset=utf-8');
+    setStatus('Downloaded CSV export.');
+  }
+
+  async function copySummary() {
+    if (items.length === 0) {
+      setStatus('Nothing to share yet.');
+      return;
+    }
+
+    const summary = buildShareSummary(items);
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(summary);
+      } else {
+        copyWithFallback(summary);
+      }
+      setStatus('Copied shareable summary to clipboard.');
+    } catch (error) {
+      console.warn('Clipboard copy failed:', error);
+      setStatus('Clipboard copy failed. Your browser may require HTTPS or clipboard permission.');
     }
   }
 
   return (
-    <main className="shell">
-      <header className="hero">
+    <main className="app-shell">
+      <section className="hero">
         <div>
-          <p className="eyebrow">Personal productivity · local first</p>
-          <h1>Tab Triage</h1>
-          <p>Paste a messy reading pile, get a relevance score, then sweep each link into keep, later, or toss.</p>
+          <p className="eyebrow">Tab Triage</p>
+          <h1>Sort messy links into Keep, Later, and Toss.</h1>
+          <p className="lede">
+            Paste URLs or titles, review the local relevance score, then export the finished board as CSV,
+            JSON, or a shareable clipboard summary.
+          </p>
         </div>
-        <button className="secondary" onClick={() => setItems(seedItems())}><RotateCcw size={16} /> Load demo</button>
-      </header>
-
-      <section className="importer">
-        <div className="importerHeader">
-          <h2><ClipboardPaste size={20} /> Paste or drop links</h2>
-          <button onClick={importItems}>Triage list</button>
+        <div className="stats" aria-label="Board counts">
+          {BUCKETS.map((bucket) => (
+            <div className="stat" key={bucket}>
+              <strong>{counts[bucket]}</strong>
+              <span>{BUCKET_LABELS[bucket]}</span>
+            </div>
+          ))}
         </div>
-        <textarea
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onDrop={handleDrop}
-          onDragOver={(e) => e.preventDefault()}
-          placeholder={'https://react.dev/learn React docs\nSQLite tips - https://sqlite.org/docs.html\nInteresting article title without URL'}
-        />
-        {message && <p className="message">{message}</p>}
       </section>
 
-      <section className="stats">
-        {counts.map((b) => <div key={b.id}><strong>{b.count}</strong><span>{b.label}</span></div>)}
-        <div><strong>{items.length ? Math.round(items.reduce((sum, i) => sum + i.score, 0) / items.length) : 0}</strong><span>Avg score</span></div>
-      </section>
-
-      <section className="board">
-        {buckets.map((bucket) => (
-          <div className="column" key={bucket.id}>
-            <div className="columnTitle"><h2>{bucket.label}</h2><span>{bucket.hint}</span></div>
-            {sortedItems.filter((item) => item.bucket === bucket.id).map((item) => (
-              <article className="card" key={item.id}>
-                <div className="cardTop">
-                  <span className={`score ${scoreClass(item.score)}`}>{item.score}</span>
-                  <button className="icon" aria-label="Delete item" onClick={() => removeItem(item.id)}><Trash2 size={15} /></button>
-                </div>
-                <h3>{item.url ? <a href={item.url} target="_blank" rel="noreferrer">{item.title}</a> : item.title}</h3>
-                {item.domain && <p className="domain">{item.domain}</p>}
-                <label>
-                  Bucket
-                  <select value={item.bucket} onChange={(e) => updateItem(item.id, { bucket: e.target.value as Bucket })}>
-                    {buckets.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}
-                  </select>
-                </label>
-                <label>
-                  Notes
-                  <input value={item.notes} onChange={(e) => updateItem(item.id, { notes: e.target.value })} placeholder="Why keep or toss?" />
-                </label>
-              </article>
-            ))}
-            {!items.some((i) => i.bucket === bucket.id) && <p className="empty"><Archive size={16} /> Nothing here yet.</p>}
+      <section className="panel import-panel" aria-labelledby="import-heading">
+        <div className="panel-heading">
+          <div>
+            <h2 id="import-heading">Import links</h2>
+            <p>One link or title per line. URLs can appear anywhere in the line.</p>
           </div>
+          <button type="button" className="secondary" onClick={() => setInput(SAMPLE_INPUT)}>
+            Load sample
+          </button>
+        </div>
+        <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={6} />
+        <div className="actions">
+          <button type="button" onClick={importItems}>
+            Import to board
+          </button>
+          <button type="button" className="danger subtle" onClick={resetBoard} disabled={items.length === 0}>
+            Clear board
+          </button>
+        </div>
+      </section>
+
+      <section className="panel export-panel" aria-labelledby="export-heading">
+        <div>
+          <h2 id="export-heading">Export & share</h2>
+          <p>Use your triaged results outside the app for follow-up, archiving, or sending to someone else.</p>
+        </div>
+        <div className="export-actions">
+          <button type="button" onClick={exportCsv} disabled={items.length === 0}>
+            Export CSV
+          </button>
+          <button type="button" onClick={exportJson} disabled={items.length === 0}>
+            Export JSON
+          </button>
+          <button type="button" className="secondary" onClick={copySummary} disabled={items.length === 0}>
+            Copy summary
+          </button>
+        </div>
+      </section>
+
+      {status && <p className="status" role="status">{status}</p>}
+
+      <section className="board" aria-label="Triaged board">
+        {BUCKETS.map((bucket) => (
+          <BucketColumn
+            key={bucket}
+            bucket={bucket}
+            items={items.filter((item) => item.bucket === bucket)}
+            onBucketChange={updateBucket}
+            onNotesChange={updateNotes}
+            onRemove={removeItem}
+          />
         ))}
       </section>
     </main>
   );
 }
 
-function scoreClass(score: number) {
-  if (score >= 68) return 'high';
-  if (score >= 38) return 'mid';
-  return 'low';
+interface BucketColumnProps {
+  bucket: Bucket;
+  items: TriagedItem[];
+  onBucketChange: (id: string, bucket: Bucket) => void;
+  onNotesChange: (id: string, notes: string) => void;
+  onRemove: (id: string) => void;
 }
+
+function BucketColumn({ bucket, items, onBucketChange, onNotesChange, onRemove }: BucketColumnProps) {
+  return (
+    <section className={`bucket bucket-${bucket}`}>
+      <header>
+        <h2>{BUCKET_LABELS[bucket]}</h2>
+        <span>{items.length}</span>
+      </header>
+      <div className="cards">
+        {items.length === 0 ? (
+          <p className="empty">No items yet.</p>
+        ) : (
+          items.map((item) => (
+            <article className="card" key={item.id}>
+              <div className="card-topline">
+                <span className="score">Score {item.score}</span>
+                <button type="button" className="icon-button" onClick={() => onRemove(item.id)} aria-label={`Remove ${item.title}`}>
+                  ×
+                </button>
+              </div>
+              <h3>{item.title}</h3>
+              {item.url && (
+                <a href={item.url} target="_blank" rel="noreferrer">
+                  {item.url}
+                </a>
+              )}
+              <label>
+                Bucket
+                <select value={item.bucket} onChange={(event) => onBucketChange(item.id, event.target.value as Bucket)}>
+                  {BUCKETS.map((option) => (
+                    <option value={option} key={option}>
+                      {BUCKET_LABELS[option]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Notes
+                <textarea
+                  value={item.notes}
+                  rows={3}
+                  placeholder="Add follow-up context…"
+                  onChange={(event) => onNotesChange(item.id, event.target.value)}
+                />
+              </label>
+            </article>
+          ))
+        )}
+      </div>
+    </section>
+  );
+}
+
+function parseInput(raw: string): TriagedItem[] {
+  return raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const url = extractUrl(line);
+      const title = cleanTitle(line, url);
+      const score = scoreItem(title, url);
+      return {
+        id: createId(),
+        title,
+        url,
+        score,
+        bucket: bucketForScore(score),
+        notes: '',
+        createdAt: new Date().toISOString(),
+      };
+    });
+}
+
+function extractUrl(line: string): string | undefined {
+  const match = line.match(/https?:\/\/[^\s]+/i);
+  return match?.[0].replace(/[),.;]+$/, '');
+}
+
+function cleanTitle(line: string, url?: string): string {
+  const withoutUrl = url ? line.replace(url, '') : line;
+  const cleaned = withoutUrl.replace(/^[-–—:|\s]+|[-–—:|\s]+$/g, '').trim();
+  if (cleaned) return cleaned;
+  if (!url) return line;
+
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname.replace(/^www\./, '');
+  } catch {
+    return url;
+  }
+}
+
+function scoreItem(title: string, url?: string): number {
+  const haystack = `${title} ${url ?? ''}`.toLowerCase();
+  let score = 45;
+
+  for (const term of SCORE_TERMS) {
+    if (haystack.includes(term)) score += 6;
+  }
+
+  for (const term of NOISY_TERMS) {
+    if (haystack.includes(term)) score -= 10;
+  }
+
+  if (url) score += 8;
+  if (title.length >= 18) score += 5;
+  if (/\.edu|\.gov|github\.com|developer\.|docs\.|sqlite\.org|react\.dev/i.test(url ?? '')) score += 10;
+  if (/youtube\.com|tiktok\.com|instagram\.com|facebook\.com/i.test(url ?? '')) score -= 12;
+
+  return Math.max(0, Math.min(100, score));
+}
+
+function bucketForScore(score: number): Bucket {
+  if (score >= 70) return 'keep';
+  if (score >= 45) return 'later';
+  return 'toss';
+}
+
+function toCsv(items: TriagedItem[]): string {
+  const rows = [
+    ['bucket', 'score', 'title', 'url', 'notes', 'createdAt'],
+    ...items.map((item) => [item.bucket, String(item.score), item.title, item.url ?? '', item.notes, item.createdAt]),
+  ];
+
+  return rows.map((row) => row.map(csvCell).join(',')).join('\n');
+}
+
+function csvCell(value: string): string {
+  const escaped = value.replace(/"/g, '""');
+  return /[",\n\r]/.test(escaped) ? `"${escaped}"` : escaped;
+}
+
+function buildShareSummary(items: TriagedItem[]): string {
+  const counts = countByBucket(items);
+  const lines = [
+    `Tab Triage Summary (${items.length} items)`,
+    `Keep: ${counts.keep} · Later: ${counts.later} · Toss: ${counts.toss}`,
+    '',
+  ];
+
+  for (const bucket of BUCKETS) {
+    lines.push(`${BUCKET_LABELS[bucket]}:`);
+    const bucketItems = items.filter((item) => item.bucket === bucket);
+    if (bucketItems.length === 0) {
+      lines.push('  - None');
+    } else {
+      for (const item of bucketItems) {
+        const target = item.url ? ` — ${item.url}` : '';
+        const notes = item.notes ? ` [Notes: ${item.notes}]` : '';
+        lines.push(`  - ${item.title}${target}${notes}`);
+      }
+    }
+    lines.push('');
+  }
+
+  return lines.join('\n').trim();
+}
+
+function downloadFile(filename: string, content: string, mimeType: string) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+function copyWithFallback(text: string) {
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', 'true');
+  textarea.style.position = 'fixed';
+  textarea.style.left = '-9999px';
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand('copy');
+  textarea.remove();
+  if (!copied) throw new Error('document.execCommand returned false');
+}
+
+function dateStamp(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function createId(): string {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+export default App;
